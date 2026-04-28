@@ -1,8 +1,26 @@
-name: Download from Commit & Save to Repo
+name: Download from URLs & Save to Repo
+
 on:
-  push:
-    branches:
-      - "**"
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated list of URLs to download'
+        required: true
+        type: string
+      mode:
+        description: 'Download mode'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - zip
+      split_threshold_mb:
+        description: 'Split files larger than this MB (0 = never split)'
+        required: false
+        default: 90
+        type: number
+
 jobs:
   save-file:
     runs-on: ubuntu-latest
@@ -14,63 +32,60 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install aria2
-        run: sudo apt-get install -y aria2
-
-      - name: Extract URLs and download files
+      - name: Install aria2 and zip
         run: |
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip
 
-          if echo "$MSG" | grep -qP 'download-zip:'; then
-            MODE="zip"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
-          elif echo "$MSG" | grep -qP 'download:'; then
-            MODE="normal"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
-          else
-            echo "❌ No download command found in commit message"
-            exit 1
-          fi
+      - name: Download files
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          URLS="${{ github.event.inputs.urls }}"
+          SPLIT_THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
+          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
 
           echo "Mode: $MODE"
+          echo "Split threshold: $SPLIT_THRESHOLD_MB MB"
+
           mkdir -p downloads tmp_downloads
 
-          for URL in $URL_LINE; do
+          # Download each URL
+          for URL in $URLS; do
             FILENAME=$(basename "$URL")
             echo "⬇️ Downloading $URL -> $FILENAME"
-
             aria2c \
               --split=2 \
               --max-connection-per-server=2 \
               --min-split-size=90M \
               --dir="tmp_downloads" \
+              --out="$FILENAME" \
               "$URL"
           done
 
+          # Zip all downloads if mode is 'zip'
           if [ "$MODE" = "zip" ]; then
-            ARCHIVE_NAME="tmp_downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
+            ARCHIVE_NAME="downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
+            echo "📦 Creating zip archive: $ARCHIVE_NAME"
             zip -j "$ARCHIVE_NAME" tmp_downloads/*
+            rm -rf tmp_downloads
+          else
+            # Normal mode: handle splitting large files
+            for FILE in tmp_downloads/*; do
+              [ -f "$FILE" ] || continue
+              SIZE=$(stat -c%s "$FILE")
+              BASENAME=$(basename "$FILE")
+
+              if [ "$SPLIT_THRESHOLD_BYTES" -gt 0 ] && [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+                echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting into ${SPLIT_THRESHOLD_MB}MB parts (zip-split)"
+                # Create a zip split into parts that can be reassembled with `zip -F`
+                zip -0 -s "${SPLIT_THRESHOLD_MB}m" "downloads/${BASENAME}.zip" -j "$FILE"
+                echo "✅ Parts: $(ls downloads/${BASENAME}.z* 2>/dev/null | wc -l)"
+              else
+                cp "$FILE" "downloads/$BASENAME"
+              fi
+            done
+            rm -rf tmp_downloads
           fi
-
-          # Split any file over 90MB using zip native split (unzip compatible)
-          for FILE in tmp_downloads/*; do
-            [ -f "$FILE" ] || continue
-            SIZE=$(stat -c%s "$FILE")
-            LIMIT=$((90 * 1024 * 1024))
-            BASENAME=$(basename "$FILE")
-
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting with zip..."
-              # zip -s creates: file.zip, file.z01, file.z02, ...
-              zip -0 -s 90m "downloads/${BASENAME}.zip" -j "$FILE"
-              echo "✅ Parts: $(ls downloads/${BASENAME}* | wc -l)"
-            else
-              cp "$FILE" "downloads/$BASENAME"
-            fi
-          done
-
-          rm -rf tmp_downloads
 
       - name: Commit & Push in batches of 5 files
         run: |
@@ -78,7 +93,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          # Collect all new/untracked files under downloads/
+          # Collect all new/modified files under downloads/
           mapfile -t ALL_FILES < <(git ls-files --others --modified --exclude-standard downloads/)
 
           TOTAL=${#ALL_FILES[@]}
@@ -101,7 +116,7 @@ jobs:
             git add "${BATCH[@]}"
             git commit -m "Add downloaded files — batch $BATCH_NUM [skip ci]"
 
-            # Pull with rebase before each push to avoid conflicts from prior batches
+            # Pull with rebase before each push to avoid conflicts
             git pull --rebase origin "$BRANCH"
             git push origin HEAD:"$BRANCH"
 
